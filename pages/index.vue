@@ -1,6 +1,7 @@
 <script setup lang="ts">
-import type { DeviceKind, DiffLine, LanguageDraft, ScriptStatus, Segment } from '~/types'
+import type { DeviceKind, DiffLine, LanguageDraft, ReviewIssue, ScriptStatus, Segment, Term } from '~/types'
 import { LANGUAGES, useScriptStore } from '~/stores/script'
+import { buildParts, issueKindLabel } from '~/utils/terminology'
 
 const store = useScriptStore()
 const activeTab = ref('editor')
@@ -12,6 +13,12 @@ const compareA = ref('')
 const compareB = ref('')
 const helpDialog = ref(false)
 const deleteTarget = ref<string | null>(null)
+
+// 术语审校
+const termDialog = ref(false)
+const termDeleteTarget = ref<Term | null>(null)
+const termForm = ref({ id: '', zh: '', en: '', ja: '', legacyEn: '', legacyJa: '' })
+const selectedIssueIds = ref<string[]>([])
 
 const statusOptions: Array<{ value: ScriptStatus; label: string; color: string }> = [
   { value: 'draft', label: '草稿', color: 'grey' },
@@ -25,6 +32,11 @@ const deviceOptions: Array<{ value: DeviceKind; label: string }> = [
   { value: 'mobile', label: '手机导览' },
   { value: 'kiosk', label: '馆内触摸屏' }
 ]
+const kindMeta: Record<string, { color: string; icon: string }> = {
+  missing: { color: 'error', icon: 'mdi-translate-off' },
+  legacy: { color: 'warning', icon: 'mdi-history' },
+  mixed: { color: 'secondary', icon: 'mdi-swap-horizontal-bold' }
+}
 
 const draft = computed(() => store.selectedDraft)
 const exhibit = computed(() => store.selectedExhibit)
@@ -40,6 +52,44 @@ const diffLines = computed<DiffLine[]>(() => {
   return buildDiff(before, after)
 })
 
+const reviewCheck = computed(() => store.currentReviewCheck)
+const activeIssues = computed<ReviewIssue[]>(() => {
+  const check = reviewCheck.value
+  if (!check) return []
+  const ignored = new Set(check.ignoredIssueIds)
+  return check.issues.filter(issue => !ignored.has(issue.id))
+})
+const ignoredIssues = computed<ReviewIssue[]>(() => {
+  const check = reviewCheck.value
+  if (!check) return []
+  const ignored = new Set(check.ignoredIssueIds)
+  return check.issues.filter(issue => ignored.has(issue.id))
+})
+interface IssueGroup { key: string; label: string; locked: boolean; issues: ReviewIssue[] }
+const issueGroups = computed<IssueGroup[]>(() => {
+  const map = new Map<string, IssueGroup>()
+  for (const issue of activeIssues.value) {
+    const key = issue.field === 'segment' ? `segment:${issue.segmentId}` : issue.field
+    let group = map.get(key)
+    if (!group) {
+      group = { key, label: issue.locationLabel, locked: issue.field === 'segment' && issue.locked, issues: [] }
+      map.set(key, group)
+    }
+    group.issues.push(issue)
+  }
+  return Array.from(map.values())
+})
+const counts = computed(() => ({
+  missing: activeIssues.value.filter(i => i.kind === 'missing').length,
+  legacy: activeIssues.value.filter(i => i.kind === 'legacy').length,
+  mixed: activeIssues.value.filter(i => i.kind === 'mixed').length
+}))
+const applicableSelected = computed(() => {
+  const selected = new Set(selectedIssueIds.value)
+  return activeIssues.value.filter(i => selected.has(i.id) && !i.locked && i.kind !== 'missing' && i.replacement)
+})
+const reviewLogs = computed(() => store.reviewLogs.slice(0, 30))
+
 onMounted(() => {
   store.hydrate()
   syncCompareSelection()
@@ -47,6 +97,25 @@ onMounted(() => {
 })
 onBeforeUnmount(() => window.removeEventListener('keydown', handleKeydown))
 watch(versions, syncCompareSelection)
+// 打开展项或切换语言后自动跑一次术语检查（结果随本地数据保留，重开可接着处理）
+watch(() => [store.selectedExhibitId, store.selectedLanguageId, store.hydrated], () => {
+  if (store.hydrated) store.autoRunReviewCheck()
+}, { immediate: true })
+watch(() => store.reviewFocus, (focus) => {
+  if (!focus) return
+  activeTab.value = 'editor'
+  nextTick(() => {
+    const id = focus.field === 'segment' ? `field-segment-${focus.segmentId}` : `field-${focus.field}`
+    const el = document.getElementById(id)
+    if (el) {
+      el.scrollIntoView({ behavior: 'smooth', block: 'center' })
+      el.classList.remove('flash-target')
+      void (el as HTMLElement).offsetWidth
+      el.classList.add('flash-target')
+      window.setTimeout(() => el.classList.remove('flash-target'), 2400)
+    }
+  })
+})
 
 function syncCompareSelection() {
   if (!versions.value.some(item => item.id === compareA.value)) compareA.value = versions.value[1]?.id || versions.value[0]?.id || ''
@@ -105,7 +174,69 @@ function buildDiff(before: string, after: string): DiffLine[] {
 function formatTime(value: string) {
   return new Date(value).toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hour12: false })
 }
+function formatFullTime(value: string) {
+  return new Date(value).toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false })
+}
 function segmentLabel(segment: Segment) { return segment.label || '未命名段落' }
+
+// —— 术语审校 ——
+function groupText(group: IssueGroup): string {
+  if (!draft.value) return ''
+  if (group.key === 'title') return draft.value.title
+  if (group.key === 'narration') return draft.value.narration
+  if (group.key === 'accessibility') return draft.value.accessibility
+  if (group.key.startsWith('segment:')) return draft.value.segments.find(s => s.id === group.key.slice(8))?.content || ''
+  return ''
+}
+function groupPreviewParts(group: IssueGroup) {
+  const text = groupText(group)
+  const selected = new Set(selectedIssueIds.value)
+  const ranges = group.issues
+    .filter(i => selected.has(i.id) && !i.locked && i.kind !== 'missing')
+    .map(i => ({ start: i.start, end: i.end }))
+  return buildParts(text, ranges)
+}
+function previewedText(group: IssueGroup): string {
+  const selected = new Set(selectedIssueIds.value)
+  let text = groupText(group)
+  for (const issue of group.issues.filter(i => selected.has(i.id) && !i.locked && i.kind !== 'missing' && i.replacement).sort((a, b) => b.start - a.start)) {
+    text = text.slice(0, issue.start) + issue.replacement! + text.slice(issue.end)
+  }
+  return text
+}
+function groupHasApplicable(group: IssueGroup): boolean {
+  return group.issues.some(i => !i.locked && i.kind !== 'missing' && i.replacement)
+}
+function applyGroup(group: IssueGroup) {
+  const ids = group.issues.filter(i => !i.locked && i.kind !== 'missing' && i.replacement).map(i => i.id)
+  store.applyReviewFixes(ids)
+  selectedIssueIds.value = selectedIssueIds.value.filter(id => !ids.includes(id))
+}
+function locate(issue: ReviewIssue) {
+  store.locateIssue(issue)
+}
+function applySelected() {
+  store.applyReviewFixes(selectedIssueIds.value)
+  selectedIssueIds.value = []
+}
+function openTermDialog(term?: Term) {
+  if (term) termForm.value = { id: term.id, zh: term.zh, en: term.en, ja: term.ja, legacyEn: term.legacyEn.join('，'), legacyJa: term.legacyJa.join('，') }
+  else termForm.value = { id: '', zh: '', en: '', ja: '', legacyEn: '', legacyJa: '' }
+  termDialog.value = true
+}
+function submitTerm() {
+  store.saveTerm(termForm.value)
+  termDialog.value = false
+}
+function confirmDeleteTerm() {
+  if (termDeleteTarget.value) store.removeTerm(termDeleteTarget.value.id)
+  termDeleteTarget.value = null
+}
+function isSelected(id: string) { return selectedIssueIds.value.includes(id) }
+function toggleIssue(id: string) {
+  if (isSelected(id)) selectedIssueIds.value = selectedIssueIds.value.filter(item => item !== id)
+  else selectedIssueIds.value.push(id)
+}
 </script>
 
 <template>
@@ -195,6 +326,7 @@ function segmentLabel(segment: Segment) { return segment.label || '未命名段�
 
         <v-tabs v-model="activeTab" color="primary" bg-color="surface" rounded="lg" class="mb-4 px-2">
           <v-tab value="editor">脚本编辑</v-tab>
+          <v-tab value="review">术语审校</v-tab>
           <v-tab value="versions">版本比较</v-tab>
           <v-tab value="preview">设备预览</v-tab>
           <v-tab value="sources">资料核对</v-tab>
@@ -226,7 +358,9 @@ function segmentLabel(segment: Segment) { return segment.label || '未命名段�
                       </div>
                     </div>
 
-                    <v-text-field label="展项标题" :model-value="draft.title" hint="面向观众的主标题" persistent-hint @change="saveDraftField('title', $event)" />
+                    <div id="field-title" class="field-anchor">
+                      <v-text-field label="展项标题" :model-value="draft.title" hint="面向观众的主标题" persistent-hint @change="saveDraftField('title', $event)" />
+                    </div>
                     <v-row class="mt-2">
                       <v-col cols="12" md="5">
                         <v-text-field label="预计朗读时长（分钟）" type="number" min="0" step="0.5" :model-value="draft.durationMinutes" @change="saveDraftField('durationMinutes', $event)" />
@@ -236,11 +370,15 @@ function segmentLabel(segment: Segment) { return segment.label || '未命名段�
                       </v-col>
                     </v-row>
 
-                    <div class="section-title mt-6 mb-2">完整讲解词</div>
-                    <v-textarea label="讲解词" rows="7" auto-grow counter :model-value="draft.narration" @change="saveDraftField('narration', $event)" />
+                    <div id="field-narration" class="field-anchor mt-2">
+                      <div class="section-title mb-2">完整讲解词</div>
+                      <v-textarea label="讲解词" rows="7" auto-grow counter :model-value="draft.narration" @change="saveDraftField('narration', $event)" />
+                    </div>
 
-                    <div class="section-title mt-6 mb-2">无障碍描述</div>
-                    <v-textarea label="无障碍描述" rows="4" auto-grow hint="描述尺寸、材质、色彩与可触摸特征，避免只依赖视觉" persistent-hint :model-value="draft.accessibility" @change="saveDraftField('accessibility', $event)" />
+                    <div id="field-accessibility" class="field-anchor mt-2">
+                      <div class="section-title mb-2">无障碍描述</div>
+                      <v-textarea label="无障碍描述" rows="4" auto-grow hint="描述尺寸、材质、色彩与可触摸特征，避免只依赖视觉" persistent-hint :model-value="draft.accessibility" @change="saveDraftField('accessibility', $event)" />
+                    </div>
                   </v-card>
 
                   <v-card class="script-card pa-4 pa-md-6 mt-5">
@@ -252,7 +390,7 @@ function segmentLabel(segment: Segment) { return segment.label || '未命名段�
                       <v-chip variant="tonal">{{ draft.segments.filter(item => item.locked).length }}/{{ draft.segments.length }} 已锁定</v-chip>
                     </div>
                     <div class="d-flex flex-column ga-3">
-                      <div v-for="(segment, index) in draft.segments" :key="segment.id" class="segment-row" :class="{ locked: segment.locked }">
+                      <div v-for="(segment, index) in draft.segments" :key="segment.id" :id="`field-segment-${segment.id}`" class="segment-row field-anchor" :class="{ locked: segment.locked }">
                         <div class="d-flex align-center ga-2">
                           <v-btn icon size="small" variant="text" :aria-label="segment.locked ? '解锁段落' : '锁定段落'" @click="store.toggleLock(segment.id)">
                             {{ segment.locked ? '🔒' : '🔓' }}
@@ -293,6 +431,172 @@ function segmentLabel(segment: Segment) { return segment.label || '未命名段�
                     <v-alert class="mt-3" type="info" variant="tonal" density="compact">
                       估算语速约 {{ Math.max(1, Math.round(draft.narration.length / 220 * 10) / 10) }} 分钟，请与目标时长核对。
                     </v-alert>
+                    <v-btn variant="tonal" color="primary" prepend-icon="mdi-spellchecks" class="mt-3" @click="activeTab = 'review'">前往术语审校</v-btn>
+                  </v-card>
+                </v-col>
+              </v-row>
+            </v-window-item>
+
+            <v-window-item value="review">
+              <v-row>
+                <v-col cols="12" lg="8">
+                  <v-card class="script-card pa-4 pa-md-6">
+                    <div class="d-flex flex-wrap align-center justify-space-between ga-3 mb-4">
+                      <div>
+                        <div class="section-title">术语检查结果</div>
+                        <div class="text-body-2 text-medium-emphasis mt-1">
+                          {{ exhibit?.code }} · {{ currentLanguage?.label }}
+                          <template v-if="reviewCheck"> · 检查于 {{ formatFullTime(reviewCheck.createdAt) }}</template>
+                        </div>
+                      </div>
+                      <div class="d-flex ga-2 flex-wrap">
+                        <v-btn color="primary" variant="tonal" prepend-icon="mdi-refresh" @click="store.runReviewCheck()">重新检查</v-btn>
+                        <v-btn variant="outlined" prepend-icon="mdi-close-circle-outline" :disabled="!reviewCheck" @click="store.dismissReviewCheck()">放弃检查</v-btn>
+                      </div>
+                    </div>
+
+                    <v-alert v-if="draft.languageId === 'zh'" type="info" variant="tonal" class="mb-4">
+                      当前是中文原稿。请切换到 English 或 日本語 文稿，检查漏译、旧译与同段混用。
+                    </v-alert>
+
+                    <template v-else>
+                      <div class="d-flex ga-2 flex-wrap mb-4">
+                        <v-chip color="error" variant="tonal" prepend-icon="mdi-translate-off">漏译 {{ counts.missing }}</v-chip>
+                        <v-chip color="warning" variant="tonal" prepend-icon="mdi-history">旧译 {{ counts.legacy }}</v-chip>
+                        <v-chip color="secondary" variant="tonal" prepend-icon="mdi-swap-horizontal-bold">混用 {{ counts.mixed }}</v-chip>
+                        <v-chip variant="tonal" prepend-icon="mdi-bookmark-outline">仅提示 {{ ignoredIssues.length }}</v-chip>
+                      </div>
+
+                      <v-alert type="warning" variant="tonal" density="compact" class="mb-4">
+                        漏译需人工翻译；已确认（锁定）段落只提示不写入。替换前可在每段下方预览，放弃检查不会改动正文。
+                      </v-alert>
+
+                      <v-alert v-if="reviewCheck && !activeIssues.length && !ignoredIssues.length" type="success" variant="tonal" class="mb-4">
+                        本次检查未发现术语问题。
+                      </v-alert>
+
+                      <div class="d-flex flex-column ga-4">
+                        <div v-for="group in issueGroups" :key="group.key" class="issue-group">
+                          <div class="d-flex align-center ga-2 flex-wrap mb-2">
+                            <v-icon size="small" color="primary">mdi-text-box-outline</v-icon>
+                            <span class="font-weight-medium">{{ group.label }}</span>
+                            <v-chip v-if="group.locked" color="success" size="x-small" variant="tonal" prepend-icon="mdi-lock">已确认段落 · 仅提示</v-chip>
+                            <v-chip size="x-small" variant="outlined">{{ group.issues.length }} 处</v-chip>
+                          </div>
+
+                          <v-list density="compact" class="issue-list rounded-lg mb-2">
+                            <v-list-item v-for="issue in group.issues" :key="issue.id" :class="{ 'issue-disabled': issue.locked || issue.kind === 'missing' }">
+                              <template #prepend>
+                                <v-tooltip v-if="!issue.locked && issue.kind !== 'missing'" location="top" text="勾选后可批量预览并替换">
+                                  <template #activator="{ props }">
+                                    <v-checkbox-btn v-bind="props" :model-value="isSelected(issue.id)" density="compact" hide-details color="primary" @update:model-value="toggleIssue(issue.id)" />
+                                  </template>
+                                </v-tooltip>
+                                <v-icon v-else :icon="issue.locked ? 'mdi-lock' : 'mdi-translate-off'" :color="issue.locked ? 'success' : 'error'" size="small" class="ma-2" />
+                              </template>
+                              <v-list-item-title>
+                                <v-chip :color="kindMeta[issue.kind].color" size="x-small" variant="tonal" class="me-2">{{ issueKindLabel(issue.kind) }}</v-chip>
+                                <span class="text-body-2">术语“{{ issue.zh }}”命中「{{ issue.matched }}」</span>
+                              </v-list-item-title>
+                              <v-list-item-subtitle class="mt-1">
+                                <template v-if="issue.kind === 'missing'">外文中残留中文原词，请人工补译为「{{ issue.replacement }}」，不能自动替换。</template>
+                                <template v-else-if="issue.kind === 'legacy'">旧译，标准译法为「{{ issue.replacement }}」。<template v-if="issue.forms && issue.forms.length > 1">同段写法：{{ issue.forms.join(' / ') }}</template></template>
+                                <template v-else>同一段出现多种译法：{{ issue.forms?.join(' / ') }}，建议统一为「{{ issue.replacement }}」。</template>
+                                <em v-if="issue.locked" class="text-success ms-1">（已确认段落，不会写入）</em>
+                              </v-list-item-subtitle>
+                              <template #append>
+                                <div class="d-flex ga-1">
+                                  <v-btn size="x-small" variant="text" prepend-icon="mdi-target" @click="locate(issue)">定位</v-btn>
+                                  <v-btn v-if="!issue.locked && issue.kind !== 'missing'" size="x-small" variant="text" color="primary" prepend-icon="mdi-auto-fix" @click="store.applyReviewFixes([issue.id])">替换</v-btn>
+                                  <v-btn size="x-small" variant="text" prepend-icon="mdi-bookmark-outline" @click="store.ignoreIssue(issue.id)">仅提示</v-btn>
+                                </div>
+                              </template>
+                            </v-list-item>
+                          </v-list>
+
+                          <div v-if="groupHasApplicable(group)" class="preview-box rounded-lg pa-3">
+                            <div class="d-flex align-center justify-space-between ga-2 flex-wrap mb-2">
+                              <span class="text-caption font-weight-bold">{{ selectedIssueIds.some(id => group.issues.some(i => i.id === id)) ? '替换预览（高亮为将改动）' : '勾选问题以预览替换' }}</span>
+                              <v-btn size="small" variant="tonal" color="primary" prepend-icon="mdi-auto-fix" :disabled="!group.issues.some(i => isSelected(i.id) && !i.locked && i.kind !== 'missing')" @click="applyGroup(group)">应用本段勾选</v-btn>
+                            </div>
+                            <p class="preview-line before mb-1"><span class="preview-tag">原文</span><span v-for="(part, pi) in groupPreviewParts(group)" :key="pi" :class="{ 'preview-mark': part.marked }">{{ part.text }}</span></p>
+                            <p class="preview-line after mb-0"><span class="preview-tag">替换后</span>{{ previewedText(group) }}</p>
+                          </div>
+                        </div>
+                      </div>
+
+                      <v-divider v-if="ignoredIssues.length" class="my-4" />
+                      <details v-if="ignoredIssues.length" class="ignored-box">
+                        <summary class="text-body-2 text-medium-emphasis cursor-pointer">仅提示的问题（{{ ignoredIssues.length }}）</summary>
+                        <v-list density="compact" class="mt-2">
+                          <v-list-item v-for="issue in ignoredIssues" :key="issue.id">
+                            <v-list-item-title class="text-body-2">
+                              <v-chip :color="kindMeta[issue.kind].color" size="x-small" variant="tonal" class="me-2">{{ issueKindLabel(issue.kind) }}</v-chip>
+                              {{ issue.locationLabel }} · “{{ issue.zh }}” · 「{{ issue.matched }}」
+                            </v-list-item-title>
+                            <template #append>
+                              <v-btn size="x-small" variant="text" prepend-icon="mdi-target" @click="locate(issue)">定位</v-btn>
+                            </template>
+                          </v-list-item>
+                        </v-list>
+                      </details>
+
+                      <v-slide-y-reverse-transition>
+                        <div v-if="applicableSelected.length" class="d-flex align-center ga-3 flex-wrap mt-5 rounded-lg pa-3 batch-bar">
+                          <span class="text-body-2 font-weight-medium">已选 {{ applicableSelected.length }} 处可替换</span>
+                          <v-spacer />
+                          <v-btn size="small" variant="text" @click="selectedIssueIds = []">清空选择</v-btn>
+                          <v-btn size="small" color="primary" variant="tonal" prepend-icon="mdi-auto-fix" @click="applySelected">预览并批量替换所选</v-btn>
+                        </div>
+                      </v-slide-y-reverse-transition>
+                    </template>
+                  </v-card>
+                </v-col>
+
+                <v-col cols="12" lg="4">
+                  <v-card class="script-card pa-5">
+                    <div class="d-flex align-center justify-space-between mb-3">
+                      <div class="section-title">术语表</div>
+                      <v-btn size="small" color="primary" variant="tonal" prepend-icon="mdi-plus" @click="openTermDialog()">登记术语</v-btn>
+                    </div>
+                    <p class="text-caption text-medium-emphasis mb-3">登记中文词与英日标准译法；调整标准译法时，旧译法会自动保留，继续用于旧译提示。</p>
+                    <v-list density="compact" class="bg-transparent">
+                      <v-list-item v-for="term in store.terms" :key="term.id" class="term-row">
+                        <v-list-item-title class="font-weight-medium">{{ term.zh }}</v-list-item-title>
+                        <v-list-item-subtitle>
+                          <div class="d-flex ga-1 flex-wrap mt-1">
+                            <v-chip size="x-small" variant="outlined" class="me-0">EN {{ term.en || '—' }}</v-chip>
+                            <v-chip size="x-small" variant="outlined" class="me-0">日 {{ term.ja || '—' }}</v-chip>
+                          </div>
+                          <div v-if="term.legacyEn.length || term.legacyJa.length" class="mt-1 text-caption">
+                            旧译：{{ [...term.legacyEn.map(t => `EN ${t}`), ...term.legacyJa.map(t => `日 ${t}`)].join('，') }}
+                          </div>
+                        </v-list-item-subtitle>
+                        <template #append>
+                          <div class="d-flex ga-1">
+                            <v-btn icon="mdi-pencil-outline" size="small" variant="text" :aria-label="`编辑术语 ${term.zh}`" @click="openTermDialog(term)" />
+                            <v-btn icon="mdi-delete-outline" size="small" variant="text" color="error" :aria-label="`删除术语 ${term.zh}`" @click="termDeleteTarget = term" />
+                          </div>
+                        </template>
+                      </v-list-item>
+                    </v-list>
+                  </v-card>
+
+                  <v-card class="script-card pa-5 mt-5">
+                    <div class="section-title mb-3">审校记录</div>
+                    <p class="text-caption text-medium-emphasis mb-3">术语、段落与时间均保存在本机，重开浏览器后可接着处理。</p>
+                    <v-timeline density="compact" side="end" v-if="reviewLogs.length">
+                      <v-timeline-item v-for="log in reviewLogs" :key="log.id" size="small" dot-color="#8a6d3b">
+                        <div class="text-body-2 font-weight-medium">{{ log.action }}<span class="text-caption text-medium-emphasis ms-2">{{ formatFullTime(log.time) }}</span></div>
+                        <div class="text-caption text-medium-emphasis">{{ log.detail }}</div>
+                        <div class="mt-1 d-flex ga-1 flex-wrap">
+                          <v-chip v-if="log.termZh" size="x-small" variant="tonal" class="me-0">{{ log.termZh }}</v-chip>
+                          <v-chip v-if="log.exhibitCode" size="x-small" variant="outlined" class="me-0">{{ log.exhibitCode }}</v-chip>
+                          <v-chip v-if="log.location" size="x-small" variant="outlined" class="me-0">{{ log.location }}</v-chip>
+                        </div>
+                      </v-timeline-item>
+                    </v-timeline>
+                    <div v-else class="text-medium-emphasis text-body-2 pa-2">尚无审校记录。</div>
                   </v-card>
                 </v-col>
               </v-row>
@@ -323,7 +627,12 @@ function segmentLabel(segment: Segment) { return segment.label || '未命名段�
                   </div>
                   <v-list class="mt-4 bg-transparent">
                     <v-list-item v-for="version in versions" :key="version.id" :title="version.name" :subtitle="formatTime(version.createdAt)">
-                      <template #append><v-btn variant="outlined" size="small" @click="store.restoreVersion(version.id)">恢复此版</v-btn></template>
+                      <template #append>
+                        <div class="d-flex ga-2 align-center">
+                          <v-chip v-if="version.reviewCheckedAt" size="x-small" variant="tonal" color="secondary" prepend-icon="mdi-spellchecks">含术语检查 {{ version.reviewIssues?.length || 0 }} 处</v-chip>
+                          <v-btn variant="outlined" size="small" @click="store.restoreVersion(version.id)">恢复此版</v-btn>
+                        </div>
+                      </template>
                     </v-list-item>
                   </v-list>
                 </template>
@@ -387,7 +696,7 @@ function segmentLabel(segment: Segment) { return segment.label || '未命名段�
       <v-card class="pa-3">
         <v-card-title>保存版本快照</v-card-title>
         <v-card-text>
-          <p class="mb-4 text-medium-emphasis">将当前“{{ draft?.title }}”的完整内容和锁定状态保存为只读版本。</p>
+          <p class="mb-4 text-medium-emphasis">将当前“{{ draft?.title }}”的完整内容、锁定状态和术语检查结果保存为只读版本。</p>
           <v-text-field v-model="versionName" label="版本名称（可选）" autofocus @keyup.enter="submitVersion" />
         </v-card-text>
         <v-card-actions><v-spacer /><v-btn @click="versionDialog = false">取消</v-btn><v-btn color="primary" @click="submitVersion">保存快照</v-btn></v-card-actions>
@@ -399,6 +708,29 @@ function segmentLabel(segment: Segment) { return segment.label || '未命名段�
         <v-card-title>删除这个段落？</v-card-title>
         <v-card-text>删除后可使用撤销恢复。</v-card-text>
         <v-card-actions><v-spacer /><v-btn @click="deleteTarget = null">取消</v-btn><v-btn color="error" @click="confirmDelete">删除</v-btn></v-card-actions>
+      </v-card>
+    </v-dialog>
+
+    <v-dialog v-model="termDialog" max-width="560">
+      <v-card class="pa-3">
+        <v-card-title>{{ termForm.id ? '调整术语' : '登记术语' }}</v-card-title>
+        <v-card-text>
+          <v-text-field v-model="termForm.zh" label="中文词" hint="如：玉琮" persistent-hint class="mb-2" />
+          <v-text-field v-model="termForm.en" label="英文标准译法" hint="如：jade cong" persistent-hint class="mb-2" />
+          <v-text-field v-model="termForm.ja" label="日文标准译法" hint="如：玉琮" persistent-hint class="mb-2" />
+          <v-text-field v-model="termForm.legacyEn" label="英文旧译法（多个用逗号或分号分隔）" persistent-hint class="mb-2" />
+          <v-text-field v-model="termForm.legacyJa" label="日文旧译法（多个用逗号或分号分隔）" persistent-hint />
+          <v-alert type="info" variant="tonal" density="compact" class="mt-3">保存时若标准译法被改动，原标准译法会自动并入旧译法，历史译法不会丢失。</v-alert>
+        </v-card-text>
+        <v-card-actions><v-spacer /><v-btn @click="termDialog = false">取消</v-btn><v-btn color="primary" :disabled="!termForm.zh.trim()" @click="submitTerm">保存术语</v-btn></v-card-actions>
+      </v-card>
+    </v-dialog>
+
+    <v-dialog :model-value="Boolean(termDeleteTarget)" max-width="440" @update:model-value="termDeleteTarget = null">
+      <v-card class="pa-3">
+        <v-card-title>删除术语“{{ termDeleteTarget?.zh }}”？</v-card-title>
+        <v-card-text>删除后该词的英日译法与旧译记录一并移除；已写入正文的替换不会回退。</v-card-text>
+        <v-card-actions><v-spacer /><v-btn @click="termDeleteTarget = null">取消</v-btn><v-btn color="error" @click="confirmDeleteTerm">删除</v-btn></v-card-actions>
       </v-card>
     </v-dialog>
 

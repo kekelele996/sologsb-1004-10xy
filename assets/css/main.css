@@ -23,3 +23,21 @@ body { margin: 0; background: #f4f0e8; }
 .status-dot { width: 9px; height: 9px; border-radius: 50%; display: inline-block; margin-right: 6px; }
 :focus-visible { outline: 3px solid #d18b21 !important; outline-offset: 2px; }
 @media (max-width: 900px) { .desktop-only { display: none !important; } }
+
+/* 术语审校 */
+.field-anchor { border-radius: 12px; scroll-margin-top: 90px; transition: box-shadow .3s ease, background-color .3s ease; }
+.field-anchor.flash-target { box-shadow: 0 0 0 3px #d18b21, 0 0 0 8px rgba(209,139,33,.18); background: #fff8ec; }
+.issue-group { border: 1px solid rgba(45,38,32,.1); border-radius: 14px; padding: 14px; background: #fff; }
+.issue-list { border: 1px solid rgba(45,38,32,.08); background: #fcfaf7 !important; }
+.issue-disabled { opacity: .92; }
+.preview-box { background: #f7f4ee; border: 1px dashed rgba(45,38,32,.25); }
+.preview-line { white-space: pre-wrap; word-break: break-word; line-height: 1.8; font-size: .9rem; }
+.preview-line.before { color: #6f665d; }
+.preview-line.after { color: #1f6338; }
+.preview-tag { display: inline-block; min-width: 3.2em; font-weight: 800; margin-right: 6px; color: #8a6d3b; }
+.preview-line.after .preview-tag { color: #1f6338; }
+.preview-mark { background: #fde2bd; border-bottom: 2px solid #d18b21; border-radius: 3px; padding: 0 2px; }
+.batch-bar { background: #eef4ef; border: 1px solid #b9d2c3; position: sticky; bottom: 12px; box-shadow: 0 8px 24px rgba(22,18,15,.12); }
+.term-row { align-items: flex-start; }
+.ignored-box summary { list-style: revert; }
+.cursor-pointer { cursor: pointer; }

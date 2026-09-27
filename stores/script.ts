@@ -1,5 +1,6 @@
 import { defineStore } from 'pinia'
-import type { Exhibit, Hall, Language, LanguageDraft, PersistedState, ScriptStatus, Segment, VersionSnapshot } from '~/types'
+import type { Exhibit, Hall, Language, LanguageDraft, PersistedState, ReviewCheck, ReviewFocus, ReviewIssue, ReviewLog, ScriptStatus, Segment, Term, VersionSnapshot } from '~/types'
+import { applyReplacements, runCheck } from '~/utils/terminology'
 
 export const LANGUAGES: Language[] = [
   { id: 'zh', code: 'zh-CN', label: '简体中文', shortLabel: '中' },
@@ -7,7 +8,8 @@ export const LANGUAGES: Language[] = [
   { id: 'ja', code: 'ja-JP', label: '日本語', shortLabel: '日' }
 ]
 
-const STORAGE_KEY = 'museum-script-studio-v1'
+const STORAGE_KEY = 'museum-script-studio-v2'
+const LEGACY_STORAGE_KEY = 'museum-script-studio-v1'
 
 const segments = (prefix: string, values: Array<[string, string, boolean?]>): Segment[] => values.map(([label, content, locked], index) => ({
   id: `${prefix}-${index + 1}`,
@@ -15,6 +17,27 @@ const segments = (prefix: string, values: Array<[string, string, boolean?]>): Se
   content,
   locked: Boolean(locked)
 }))
+
+function seedTerms(): Term[] {
+  const now = '2026-09-20T01:00:00.000Z'
+  return [
+    {
+      id: 'term-cong', zh: '玉琮', en: 'jade cong', ja: '玉琮',
+      legacyEn: ['jade tube'], legacyJa: ['玉製の琮'],
+      createdAt: now, updatedAt: now
+    },
+    {
+      id: 'term-liangzhu', zh: '良渚', en: 'Liangzhu', ja: '良渚',
+      legacyEn: ['Liang-chu', 'Liangzhu culture'], legacyJa: ['良渚文化'],
+      createdAt: now, updatedAt: now
+    },
+    {
+      id: 'term-jue', zh: '青铜爵', en: 'bronze jue', ja: '青銅爵',
+      legacyEn: ['bronze wine cup', 'jue cup'], legacyJa: ['爵'],
+      createdAt: now, updatedAt: now
+    }
+  ]
+}
 
 function demoState(): PersistedState {
   const halls: Hall[] = [
@@ -47,7 +70,7 @@ function demoState(): PersistedState {
           status: 'review', updatedAt: '2026-09-24T02:15:00.000Z',
           segments: segments('jade-en', [
             ['Introduction', 'This jade cong is about five thousand years old.', true],
-            ['Visual description', 'Its square body encloses a circular opening, while spirit-and-animal motifs cover the corners.'],
+            ['Visual description', 'A jade tube encloses a circular opening, while jade cong motifs cover the corners.'],
             ['Meaning', 'Jade cong is understood as a ritual link between heaven and earth.']
           ])
         },
@@ -107,6 +130,9 @@ function demoState(): PersistedState {
     halls,
     exhibits,
     versions: [],
+    terms: seedTerms(),
+    reviewChecks: [],
+    reviewLogs: [],
     selectedHallId: halls[0].id,
     selectedExhibitId: exhibits[0].id,
     selectedLanguageId: 'zh',
@@ -119,6 +145,9 @@ export const useScriptStore = defineStore('museum-script', {
     halls: [] as Hall[],
     exhibits: [] as Exhibit[],
     versions: [] as VersionSnapshot[],
+    terms: [] as Term[],
+    reviewChecks: [] as ReviewCheck[],
+    reviewLogs: [] as ReviewLog[],
     selectedHallId: '',
     selectedExhibitId: '',
     selectedLanguageId: 'zh',
@@ -126,7 +155,10 @@ export const useScriptStore = defineStore('museum-script', {
     hydrated: false,
     past: [] as string[],
     future: [] as string[],
-    notice: ''
+    notice: '',
+    reviewFocus: null as ReviewFocus | null,
+    /** 恢复版本后冻结该展项语言的自动检查，避免覆盖快照当时的结果 */
+    frozenReviewScope: ''
   }),
   getters: {
     selectedHall(state): Hall | undefined {
@@ -141,6 +173,11 @@ export const useScriptStore = defineStore('museum-script', {
     selectedDraft(): LanguageDraft | undefined {
       return this.selectedExhibit?.drafts.find(draft => draft.languageId === this.selectedLanguageId)
     },
+    currentReviewCheck(state): ReviewCheck | undefined {
+      return state.reviewChecks
+        .filter(item => item.exhibitId === state.selectedExhibitId && item.languageId === state.selectedLanguageId)
+        .sort((a, b) => b.createdAt.localeCompare(a.createdAt))[0]
+    },
     wordCount(): number {
       return (this.selectedDraft?.narration || '').replace(/\s/g, '').length
     },
@@ -154,24 +191,39 @@ export const useScriptStore = defineStore('museum-script', {
       if (saved) {
         try {
           const data = JSON.parse(saved) as PersistedState
-          this.$patch({ ...data, hydrated: true })
+          this.$patch({ ...data, terms: data.terms || [], reviewChecks: data.reviewChecks || [], reviewLogs: data.reviewLogs || [], hydrated: true })
           if (!this.halls.length || !this.exhibits.length) this.resetDemo()
         } catch {
           this.resetDemo()
         }
       } else {
-        this.resetDemo()
+        // 首次升级到术语审校版本：保留旧版本地稿件，补齐术语数据
+        const legacy = localStorage.getItem(LEGACY_STORAGE_KEY)
+        if (legacy) {
+          try {
+            const data = JSON.parse(legacy) as PersistedState
+            this.$patch({ ...data, terms: seedTerms(), reviewChecks: [], reviewLogs: [], hydrated: true })
+            this.persist()
+          } catch {
+            this.resetDemo()
+          }
+        } else {
+          this.resetDemo()
+        }
       }
       this.ensureSelection()
       this.hydrated = true
     },
     resetDemo() {
-      this.$patch({ ...demoState(), hydrated: true, past: [], future: [] })
+      this.$patch({ ...demoState(), hydrated: true, past: [], future: [], reviewFocus: null })
       this.persist()
       this.notice = '示例数据已就绪，可直接开始编辑。'
     },
     snapshot(): string {
-      return JSON.stringify({ halls: this.halls, exhibits: this.exhibits, versions: this.versions })
+      return JSON.stringify({
+        halls: this.halls, exhibits: this.exhibits, versions: this.versions,
+        terms: this.terms, reviewChecks: this.reviewChecks, reviewLogs: this.reviewLogs
+      })
     },
     commit(mutator: () => void) {
       this.past.push(this.snapshot())
@@ -185,6 +237,7 @@ export const useScriptStore = defineStore('museum-script', {
       if (typeof localStorage === 'undefined') return
       const data: PersistedState = {
         halls: this.halls, exhibits: this.exhibits, versions: this.versions,
+        terms: this.terms, reviewChecks: this.reviewChecks, reviewLogs: this.reviewLogs,
         selectedHallId: this.selectedHallId, selectedExhibitId: this.selectedExhibitId,
         selectedLanguageId: this.selectedLanguageId, lastSavedAt: this.lastSavedAt
       }
@@ -198,6 +251,7 @@ export const useScriptStore = defineStore('museum-script', {
       if (!exhibit?.drafts.some(draft => draft.languageId === this.selectedLanguageId)) this.selectedLanguageId = exhibit?.drafts[0]?.languageId || 'zh'
     },
     selectHall(id: string) {
+      this.frozenReviewScope = ''
       this.selectedHallId = id
       const exhibit = this.exhibits.find(item => item.hallId === id)
       this.selectedExhibitId = exhibit?.id || ''
@@ -205,11 +259,13 @@ export const useScriptStore = defineStore('museum-script', {
       this.persist()
     },
     selectExhibit(id: string) {
+      this.frozenReviewScope = ''
       this.selectedExhibitId = id
       this.ensureSelection()
       this.persist()
     },
     selectLanguage(id: string) {
+      this.frozenReviewScope = ''
       this.selectedLanguageId = id
       this.persist()
     },
@@ -253,13 +309,16 @@ export const useScriptStore = defineStore('museum-script', {
     createVersion(name?: string) {
       const draft = this.selectedDraft
       if (!draft) return
+      const check = this.currentReviewCheck
       const version: VersionSnapshot = {
         id: `version-${Date.now()}`,
         exhibitId: this.selectedExhibitId,
         languageId: this.selectedLanguageId,
         name: name || `${new Date().toLocaleString('zh-CN', { hour12: false })} 快照`,
         createdAt: new Date().toISOString(),
-        draft: JSON.parse(JSON.stringify(draft))
+        draft: JSON.parse(JSON.stringify(draft)),
+        reviewCheckedAt: check?.createdAt,
+        reviewIssues: check ? JSON.parse(JSON.stringify(check.issues)) : []
       }
       this.commit(() => this.versions.unshift(version))
       this.notice = '已保存当前版本，可在版本页比较或恢复。'
@@ -267,6 +326,7 @@ export const useScriptStore = defineStore('museum-script', {
     restoreVersion(id: string) {
       const version = this.versions.find(item => item.id === id)
       if (!version) return
+      const frozenIssues: ReviewIssue[] = version.reviewIssues ? JSON.parse(JSON.stringify(version.reviewIssues)) : []
       this.commit(() => {
         const exhibit = this.exhibits.find(item => item.id === version.exhibitId)
         if (!exhibit) return
@@ -274,10 +334,24 @@ export const useScriptStore = defineStore('museum-script', {
         const restored = JSON.parse(JSON.stringify(version.draft)) as LanguageDraft
         if (index >= 0) exhibit.drafts[index] = restored
         else exhibit.drafts.push(restored)
+        // 检查结果回到快照当时：同一展项语言的后续检查结果移除，补入冻结结果
+        this.reviewChecks = this.reviewChecks.filter(item => !(item.exhibitId === version.exhibitId && item.languageId === version.languageId))
+        if (version.reviewCheckedAt && frozenIssues.length >= 0) {
+          this.reviewChecks.unshift({
+            id: `check-frozen-${version.id}`,
+            exhibitId: version.exhibitId,
+            languageId: version.languageId,
+            createdAt: version.reviewCheckedAt,
+            issues: frozenIssues,
+            ignoredIssueIds: []
+          })
+        }
+        this.pushReviewLog('恢复版本', `恢复版本“${version.name}”，检查结果回到 ${new Date(version.createdAt).toLocaleString('zh-CN', { hour12: false })} 时的内容`, exhibit.code)
       })
       this.selectedExhibitId = version.exhibitId
       this.selectedLanguageId = version.languageId
-      this.notice = '版本已恢复，并作为一次可撤销操作保存。'
+      this.frozenReviewScope = `${version.exhibitId}:${version.languageId}`
+      this.notice = '版本已恢复，术语检查结果也回到该版本当时；本次恢复可撤销。'
     },
     undo() {
       const state = this.past.pop()
@@ -304,6 +378,165 @@ export const useScriptStore = defineStore('museum-script', {
       if (!draft) return 0
       const checks = [draft.title, draft.narration, draft.accessibility, draft.sources, draft.segments.length > 0 ? 'segments' : '']
       return Math.round(checks.filter(Boolean).length / checks.length * 100)
+    },
+
+    // —— 术语审校 ——
+
+    pushReviewLog(action: ReviewLog['action'], detail: string, exhibitCode?: string, termZh?: string, location?: string) {
+      this.reviewLogs.unshift({
+        id: `log-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+        time: new Date().toISOString(),
+        action, detail, termZh, exhibitCode, location
+      })
+      if (this.reviewLogs.length > 300) this.reviewLogs.length = 300
+    },
+    saveTerm(input: { id?: string; zh: string; en: string; ja: string; legacyEn: string; legacyJa: string }) {
+      const zh = input.zh.trim()
+      if (!zh) { this.notice = '中文术语不能为空。'; return }
+      const parse = (raw: string) => raw.split(/[;,；，\n]/).map(item => item.trim()).filter(Boolean)
+      const draft = this.selectedDraft
+      const exhibit = this.selectedExhibit
+      const existing = input.id ? this.terms.find(item => item.id === input.id) : this.terms.find(item => item.zh === zh)
+      const now = new Date().toISOString()
+      this.commit(() => {
+        if (existing) {
+          // 调整标准译法时，把旧标准译法保留下来，仍用于审校旧译提示
+          const legacyEn = Array.from(new Set([...parse(input.legacyEn), ...(input.en.trim() && input.en.trim() !== existing.en && existing.en ? [existing.en] : [])]))
+          const legacyJa = Array.from(new Set([...parse(input.legacyJa), ...(input.ja.trim() && input.ja.trim() !== existing.ja && existing.ja ? [existing.ja] : [])]))
+          Object.assign(existing, { zh, en: input.en.trim(), ja: input.ja.trim(), legacyEn, legacyJa, updatedAt: now })
+          this.pushReviewLog('调整术语', `术语“${zh}”标准译法已更新，旧译法保留 ${legacyEn.length + legacyJa.length} 条`, exhibit?.code, zh)
+        } else {
+          this.terms.push({
+            id: `term-${Date.now()}`, zh, en: input.en.trim(), ja: input.ja.trim(),
+            legacyEn: parse(input.legacyEn), legacyJa: parse(input.legacyJa),
+            createdAt: now, updatedAt: now
+          })
+          this.pushReviewLog('登记术语', `登记术语“${zh}”（英：${input.en.trim() || '未填'}；日：${input.ja.trim() || '未填'}）`, exhibit?.code, zh)
+        }
+      })
+      this.notice = existing ? `术语“${zh}”已调整，旧译法继续保留。` : `术语“${zh}”已登记。`
+    },
+    removeTerm(id: string) {
+      const term = this.terms.find(item => item.id === id)
+      if (!term) return
+      this.commit(() => {
+        this.terms = this.terms.filter(item => item.id !== id)
+        this.pushReviewLog('删除术语', `删除术语“${term.zh}”及其译法记录`, this.selectedExhibit?.code, term.zh)
+      })
+      this.notice = `术语“${term.zh}”已删除。`
+    },
+    /** 打开展项/语言时自动执行：只更新检查结果，不写日志、不入撤销栈 */
+    autoRunReviewCheck() {
+      const draft = this.selectedDraft
+      if (!draft || draft.languageId === 'zh' || !this.terms.length) return
+      if (this.frozenReviewScope === `${this.selectedExhibitId}:${this.selectedLanguageId}`) return
+      const issues = runCheck(draft, this.terms)
+      const previous = this.currentReviewCheck
+      this.reviewChecks = this.reviewChecks.filter(item => !(item.exhibitId === this.selectedExhibitId && item.languageId === this.selectedLanguageId))
+      this.reviewChecks.unshift({
+        id: `check-${Date.now()}-auto`,
+        exhibitId: this.selectedExhibitId,
+        languageId: this.selectedLanguageId,
+        createdAt: new Date().toISOString(),
+        issues,
+        ignoredIssueIds: previous?.ignoredIssueIds || []
+      })
+      this.persist()
+    },
+    runReviewCheck() {
+      const draft = this.selectedDraft
+      const exhibit = this.selectedExhibit
+      if (!draft) return
+      if (draft.languageId === 'zh') { this.notice = '中文原稿不需要术语检查，请切换到英文或日文。'; return }
+      if (!this.terms.length) { this.notice = '请先在术语表登记中文词与英日标准译法。'; return }
+      this.frozenReviewScope = ''
+      const issues = runCheck(draft, this.terms)
+      this.commit(() => {
+        this.reviewChecks = this.reviewChecks.filter(item => !(item.exhibitId === this.selectedExhibitId && item.languageId === this.selectedLanguageId))
+        this.reviewChecks.unshift({
+          id: `check-${Date.now()}`,
+          exhibitId: this.selectedExhibitId,
+          languageId: this.selectedLanguageId,
+          createdAt: new Date().toISOString(),
+          issues,
+          ignoredIssueIds: []
+        })
+        this.pushReviewLog('运行检查', `检查 ${draft.languageId === 'en' ? '英文' : '日文'} 文稿，发现 ${issues.length} 处问题`, exhibit?.code)
+      })
+      this.notice = `检查完成：漏译 ${issues.filter(i => i.kind === 'missing').length} 处，旧译 ${issues.filter(i => i.kind === 'legacy').length} 处，混用 ${issues.filter(i => i.kind === 'mixed').length} 处。`
+    },
+    /** 放弃检查：仅清掉本次检查结果，正文不动 */
+    dismissReviewCheck() {
+      const check = this.currentReviewCheck
+      const exhibit = this.selectedExhibit
+      if (!check) return
+      this.commit(() => {
+        this.reviewChecks = this.reviewChecks.filter(item => item.id !== check.id)
+        this.pushReviewLog('放弃检查', '放弃本次检查结果，正文未改动', exhibit?.code)
+      })
+      this.notice = '已放弃检查结果，正文未做任何改动。'
+    },
+    ignoreIssue(issueId: string) {
+      const check = this.currentReviewCheck
+      const issue = check?.issues.find(item => item.id === issueId)
+      if (!check || !issue) return
+      this.commit(() => {
+        if (!check.ignoredIssueIds.includes(issueId)) check.ignoredIssueIds.push(issueId)
+        this.pushReviewLog('忽略问题', `标记“${issue.zh}”${issue.locationLabel}的${issue.kind === 'missing' ? '漏译' : issue.kind === 'legacy' ? '旧译' : '混用'}为仅提示`, this.selectedExhibit?.code, issue.zh, issue.locationLabel)
+      })
+      this.notice = '已标记为仅提示，不会被批量替换。'
+    },
+    /** 请求跳转到编辑器对应位置（不修改内容） */
+    locateIssue(issue: ReviewIssue) {
+      this.reviewFocus = { field: issue.field, segmentId: issue.segmentId, at: Date.now() }
+    },
+    /** 按问题 id 应用替换；漏译与已确认（锁定）段落仅提示，不会写入 */
+    applyReviewFixes(issueIds: string[]) {
+      const draft = this.selectedDraft
+      const check = this.currentReviewCheck
+      const exhibit = this.selectedExhibit
+      if (!draft || !check) return
+      const wanted = new Set(issueIds)
+      const applicable = check.issues.filter(issue =>
+        wanted.has(issue.id) && !check.ignoredIssueIds.includes(issue.id) &&
+        issue.replacement && !issue.locked && issue.kind !== 'missing')
+
+      if (!applicable.length) {
+        this.notice = '所选问题无需写入：漏译请人工翻译，已确认段落只提示不写入。'
+        return
+      }
+
+      const byTarget = new Map<string, ReviewIssue[]>()
+      for (const issue of applicable) {
+        const key = issue.field === 'segment' ? `segment:${issue.segmentId}` : issue.field
+        const list = byTarget.get(key) || []
+        list.push(issue)
+        byTarget.set(key, list)
+      }
+
+      const termNames = Array.from(new Set(applicable.map(i => i.zh)))
+      const skippedLocked = check.issues.filter(i => wanted.has(i.id) && i.locked).length
+      this.frozenReviewScope = ''
+      this.commit(() => {
+        for (const [key, list] of byTarget) {
+          if (key === 'title') { draft.title = applyReplacements(draft.title, list as Array<ReviewIssue & { replacement: string }>) }
+          else if (key === 'narration') { draft.narration = applyReplacements(draft.narration, list as Array<ReviewIssue & { replacement: string }>) }
+          else if (key === 'accessibility') { draft.accessibility = applyReplacements(draft.accessibility, list as Array<ReviewIssue & { replacement: string }>) }
+          else if (key.startsWith('segment:')) {
+            const segment = draft.segments.find(item => item.id === key.slice(8))
+            if (segment && !segment.locked) segment.content = applyReplacements(segment.content, list as Array<ReviewIssue & { replacement: string }>)
+          }
+        }
+        draft.updatedAt = new Date().toISOString()
+        for (const issue of applicable) {
+          this.pushReviewLog('应用替换', `“${issue.matched}” → “${issue.replacement}”`, exhibit?.code, issue.zh, issue.locationLabel)
+        }
+        // 替换后重新检查，让段落状态即时更新
+        const issues = runCheck(draft, this.terms)
+        this.reviewChecks = this.reviewChecks.filter(item => item.id !== check.id)
+        this.reviewChecks.unshift({ id: `check-${Date.now()}-after-fix`, exhibitId: this.selectedExhibitId, languageId: this.selectedLanguageId, createdAt: new Date().toISOString(), issues, ignoredIssueIds: [] })
+      })
+      this.notice = `已把 ${applicable.length} 处替换写入正文（涉及术语：${termNames.join('、')}）。${skippedLocked ? `另有 ${skippedLocked} 处在已确认段落，仅提示未写入。` : ''}`
     }
   }
 })
