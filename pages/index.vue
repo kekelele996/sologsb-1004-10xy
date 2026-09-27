@@ -1,6 +1,7 @@
 <script setup lang="ts">
-import type { DeviceKind, DiffLine, LanguageDraft, ScriptStatus, Segment } from '~/types'
+import type { DeviceKind, DiffLine, LanguageDraft, ScriptStatus, Segment, TermIssue } from '~/types'
 import { LANGUAGES, useScriptStore } from '~/stores/script'
+import { buildTermIssues } from '~/utils/terminology'
 
 const store = useScriptStore()
 const activeTab = ref('editor')
@@ -32,6 +33,7 @@ const currentLanguage = computed(() => LANGUAGES.find(item => item.id === store.
 const currentStatus = computed(() => statusOptions.find(item => item.value === draft.value?.status) || statusOptions[0])
 const filteredExhibits = computed(() => store.hallExhibits.filter(item => !leftFilter.value || `${item.code} ${item.title}`.toLowerCase().includes(leftFilter.value.toLowerCase())))
 const versions = computed(() => store.versions.filter(item => item.exhibitId === store.selectedExhibitId && item.languageId === store.selectedLanguageId))
+const termIssueCount = computed(() => exhibit.value ? buildTermIssues(exhibit.value, store.terms).length : 0)
 const selectedVersionA = computed(() => versions.value.find(item => item.id === compareA.value))
 const selectedVersionB = computed(() => versions.value.find(item => item.id === compareB.value))
 const diffLines = computed<DiffLine[]>(() => {
@@ -83,6 +85,18 @@ function submitVersion() {
 function confirmDelete() {
   if (deleteTarget.value) store.removeSegment(deleteTarget.value)
   deleteTarget.value = null
+}
+async function locateIssue(issue: TermIssue) {
+  store.selectLanguage(issue.kind === 'missing' ? 'zh' : issue.languageId)
+  activeTab.value = 'editor'
+  await nextTick()
+  const el = document.getElementById(`segment-${issue.segmentId}`)
+  if (el) {
+    el.scrollIntoView({ behavior: 'smooth', block: 'center' })
+    el.classList.add('segment-flash')
+    window.setTimeout(() => el.classList.remove('segment-flash'), 2000)
+  }
+  store.notice = '已定位到相关段落。'
 }
 function buildDiff(before: string, after: string): DiffLine[] {
   const a = before.split(/(?<=[。！？.!?])\s*/).filter(Boolean)
@@ -195,6 +209,10 @@ function segmentLabel(segment: Segment) { return segment.label || '未命名段�
 
         <v-tabs v-model="activeTab" color="primary" bg-color="surface" rounded="lg" class="mb-4 px-2">
           <v-tab value="editor">脚本编辑</v-tab>
+          <v-tab value="terms">
+            术语审校
+            <v-chip v-if="termIssueCount" size="x-small" color="error" variant="flat" class="ms-2">{{ termIssueCount }}</v-chip>
+          </v-tab>
           <v-tab value="versions">版本比较</v-tab>
           <v-tab value="preview">设备预览</v-tab>
           <v-tab value="sources">资料核对</v-tab>
@@ -252,7 +270,7 @@ function segmentLabel(segment: Segment) { return segment.label || '未命名段�
                       <v-chip variant="tonal">{{ draft.segments.filter(item => item.locked).length }}/{{ draft.segments.length }} 已锁定</v-chip>
                     </div>
                     <div class="d-flex flex-column ga-3">
-                      <div v-for="(segment, index) in draft.segments" :key="segment.id" class="segment-row" :class="{ locked: segment.locked }">
+                      <div v-for="(segment, index) in draft.segments" :id="`segment-${segment.id}`" :key="segment.id" class="segment-row" :class="{ locked: segment.locked }">
                         <div class="d-flex align-center ga-2">
                           <v-btn icon size="small" variant="text" :aria-label="segment.locked ? '解锁段落' : '锁定段落'" @click="store.toggleLock(segment.id)">
                             {{ segment.locked ? '🔒' : '🔓' }}
@@ -296,6 +314,10 @@ function segmentLabel(segment: Segment) { return segment.label || '未命名段�
                   </v-card>
                 </v-col>
               </v-row>
+            </v-window-item>
+
+            <v-window-item value="terms">
+              <TerminologyPanel @locate="locateIssue" />
             </v-window-item>
 
             <v-window-item value="versions">
@@ -378,6 +400,9 @@ function segmentLabel(segment: Segment) { return segment.label || '未命名段�
               </v-row>
             </v-window-item>
           </v-window>
+        </div>
+        <div v-else-if="exhibit && activeTab === 'terms'">
+          <TerminologyPanel @locate="locateIssue" />
         </div>
         <v-empty-state v-else icon="mdi-script-text-outline" title="尚未选择展项" text="请从左侧选择一个展厅和展项。" />
       </div>

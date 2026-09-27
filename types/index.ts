@@ -52,10 +52,58 @@ export interface VersionSnapshot {
   draft: LanguageDraft
 }
 
+export interface TermVariant {
+  id: string
+  text: string
+  kind: 'standard' | 'former'
+  createdAt: string
+}
+
+export interface Term {
+  id: string
+  zh: string
+  languageId: string
+  variants: TermVariant[]
+  updatedAt: string
+}
+
+export interface TermLog {
+  id: string
+  termId: string
+  zh: string
+  languageId: string
+  exhibitId: string
+  exhibitTitle: string
+  segmentId: string
+  segmentLabel: string
+  from: string
+  to: string
+  at: string
+}
+
+export type TermIssueKind = 'missing' | 'former' | 'mixed'
+
+export interface TermIssue {
+  id: string
+  kind: TermIssueKind
+  termId: string
+  zh: string
+  languageId: string
+  standard: string
+  matched: string[]
+  segmentId: string
+  segmentLabel: string
+  segmentIndex: number
+  locked: boolean
+  content: string
+}
+
 export interface PersistedState {
   halls: Hall[]
   exhibits: Exhibit[]
   versions: VersionSnapshot[]
+  terms: Term[]
+  termLogs: TermLog[]
   selectedHallId: string
   selectedExhibitId: string
   selectedLanguageId: string

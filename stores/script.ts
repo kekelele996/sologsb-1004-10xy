@@ -1,5 +1,5 @@
 import { defineStore } from 'pinia'
-import type { Exhibit, Hall, Language, LanguageDraft, PersistedState, ScriptStatus, Segment, VersionSnapshot } from '~/types'
+import type { Exhibit, Hall, Language, LanguageDraft, PersistedState, ScriptStatus, Segment, Term, TermLog, TermVariant, VersionSnapshot } from '~/types'
 
 export const LANGUAGES: Language[] = [
   { id: 'zh', code: 'zh-CN', label: '简体中文', shortLabel: '中' },
@@ -15,6 +15,20 @@ const segments = (prefix: string, values: Array<[string, string, boolean?]>): Se
   content,
   locked: Boolean(locked)
 }))
+
+function demoTerms(): Term[] {
+  const at = '2026-09-20T02:00:00.000Z'
+  const variant = (id: string, text: string, kind: TermVariant['kind']): TermVariant => ({ id, text, kind, createdAt: at })
+  return [
+    { id: 'term-yucong-en', zh: '玉琮', languageId: 'en', updatedAt: at, variants: [variant('var-yucong-en-1', 'jade cong', 'standard'), variant('var-yucong-en-2', 'jade tsung', 'former')] },
+    { id: 'term-yucong-ja', zh: '玉琮', languageId: 'ja', updatedAt: at, variants: [variant('var-yucong-ja-1', '玉琮', 'standard')] },
+    { id: 'term-shenren-en', zh: '神人兽面纹', languageId: 'en', updatedAt: at, variants: [variant('var-shenren-en-1', 'spirit-and-animal motif', 'standard')] },
+    { id: 'term-shenren-ja', zh: '神人兽面纹', languageId: 'ja', updatedAt: at, variants: [variant('var-shenren-ja-1', '神人獣面文', 'standard')] },
+    { id: 'term-liangzhu-en', zh: '良渚文化', languageId: 'en', updatedAt: at, variants: [variant('var-liangzhu-en-1', 'Liangzhu culture', 'standard'), variant('var-liangzhu-en-2', 'Liang-chu culture', 'former')] },
+    { id: 'term-jue-en', zh: '青铜爵', languageId: 'en', updatedAt: at, variants: [variant('var-jue-en-1', 'bronze jue', 'standard'), variant('var-jue-en-2', 'bronze jue cup', 'former')] },
+    { id: 'term-liqi-ja', zh: '礼器', languageId: 'ja', updatedAt: at, variants: [variant('var-liqi-ja-1', '礼器', 'standard'), variant('var-liqi-ja-2', '祭器', 'former')] }
+  ]
+}
 
 function demoState(): PersistedState {
   const halls: Hall[] = [
@@ -46,9 +60,10 @@ function demoState(): PersistedState {
           durationMinutes: 2.3, sources: 'Complete Collection of Chinese Jades, Vol. 1; Museum accession 1987-J-042',
           status: 'review', updatedAt: '2026-09-24T02:15:00.000Z',
           segments: segments('jade-en', [
-            ['Introduction', 'This jade cong is about five thousand years old.', true],
-            ['Visual description', 'Its square body encloses a circular opening, while spirit-and-animal motifs cover the corners.'],
-            ['Meaning', 'Jade cong is understood as a ritual link between heaven and earth.']
+            ['Introduction', 'This jade tsung is about five thousand years old.', true],
+            ['Visual description', 'Its square body encloses a circular opening, while a spirit-and-animal motif covers each corner.'],
+            ['Meaning', 'Jade cong is understood as a ritual link between heaven and earth.'],
+            ['Background', 'The Liangzhu culture, once spelled Liang-chu culture, flourished in the Yangtze delta.']
           ])
         },
         {
@@ -87,7 +102,7 @@ function demoState(): PersistedState {
           accessibility: 'The tactile replica includes the long spout, tripod feet, and raised posts.',
           durationMinutes: 2.8, sources: 'A General Survey of Yin-Zhou Bronzes; Gallery label A-08',
           status: 'draft', updatedAt: '2026-09-22T09:00:00.000Z',
-          segments: segments('bronze-en', [['Object', 'This bronze jue dates to the Shang dynasty.'], ['Structure', 'Three legs support the body; the long spout guides the pour.']])
+          segments: segments('bronze-en', [['Object', 'This bronze jue cup dates to the Shang dynasty.'], ['Structure', 'Three legs support the body; the long spout guides the pour.']])
         }
       ]
     },
@@ -107,6 +122,8 @@ function demoState(): PersistedState {
     halls,
     exhibits,
     versions: [],
+    terms: demoTerms(),
+    termLogs: [],
     selectedHallId: halls[0].id,
     selectedExhibitId: exhibits[0].id,
     selectedLanguageId: 'zh',
@@ -119,6 +136,8 @@ export const useScriptStore = defineStore('museum-script', {
     halls: [] as Hall[],
     exhibits: [] as Exhibit[],
     versions: [] as VersionSnapshot[],
+    terms: [] as Term[],
+    termLogs: [] as TermLog[],
     selectedHallId: '',
     selectedExhibitId: '',
     selectedLanguageId: 'zh',
@@ -153,9 +172,12 @@ export const useScriptStore = defineStore('museum-script', {
       const saved = localStorage.getItem(STORAGE_KEY)
       if (saved) {
         try {
-          const data = JSON.parse(saved) as PersistedState
+          const data = JSON.parse(saved) as Partial<PersistedState>
           this.$patch({ ...data, hydrated: true })
           if (!this.halls.length || !this.exhibits.length) this.resetDemo()
+          // 旧版本存档没有术语数据时，补一份演示术语；记录则从零开始
+          if (!Array.isArray(data.terms)) this.terms = demoTerms()
+          if (!Array.isArray(data.termLogs)) this.termLogs = []
         } catch {
           this.resetDemo()
         }
@@ -185,6 +207,7 @@ export const useScriptStore = defineStore('museum-script', {
       if (typeof localStorage === 'undefined') return
       const data: PersistedState = {
         halls: this.halls, exhibits: this.exhibits, versions: this.versions,
+        terms: this.terms, termLogs: this.termLogs,
         selectedHallId: this.selectedHallId, selectedExhibitId: this.selectedExhibitId,
         selectedLanguageId: this.selectedLanguageId, lastSavedAt: this.lastSavedAt
       }
@@ -278,6 +301,82 @@ export const useScriptStore = defineStore('museum-script', {
       this.selectedExhibitId = version.exhibitId
       this.selectedLanguageId = version.languageId
       this.notice = '版本已恢复，并作为一次可撤销操作保存。'
+    },
+    addTerm(zh: string, languageId: string, text: string) {
+      const word = zh.trim()
+      const translation = text.trim()
+      if (!word || !translation) return
+      if (this.terms.some(term => term.zh === word && term.languageId === languageId)) {
+        this.notice = `“${word}”在该语言下已登记，请使用“调整译法”。`
+        return
+      }
+      const now = new Date().toISOString()
+      this.terms.unshift({
+        id: `term-${Date.now()}`,
+        zh: word,
+        languageId,
+        updatedAt: now,
+        variants: [{ id: `variant-${Date.now()}`, text: translation, kind: 'standard', createdAt: now }]
+      })
+      this.persist()
+      this.notice = `已登记术语“${word}”。`
+    },
+    adjustTerm(termId: string, text: string) {
+      const term = this.terms.find(item => item.id === termId)
+      const translation = text.trim()
+      if (!term || !translation) return
+      const current = term.variants.find(variant => variant.kind === 'standard')
+      if (current?.text === translation) return
+      const now = new Date().toISOString()
+      // 旧标准译法降级保留，用于检查稿件中的旧译与混用
+      if (current) current.kind = 'former'
+      const existing = term.variants.find(variant => variant.text === translation)
+      if (existing) existing.kind = 'standard'
+      else term.variants.unshift({ id: `variant-${Date.now()}`, text: translation, kind: 'standard', createdAt: now })
+      term.updatedAt = now
+      this.persist()
+      this.notice = current ? `标准译法已更新为“${translation}”，旧译法“${current.text}”已保留。` : `已登记“${term.zh}”的标准译法。`
+    },
+    removeTerm(termId: string) {
+      this.terms = this.terms.filter(term => term.id !== termId)
+      this.persist()
+      this.notice = '术语已删除。'
+    },
+    applyTermFix(payload: { exhibitId: string; languageId: string; segmentId: string; termId: string; zh: string; from: string[]; to: string; afterText: string }): boolean {
+      const exhibit = this.exhibits.find(item => item.id === payload.exhibitId)
+      const draft = exhibit?.drafts.find(item => item.languageId === payload.languageId)
+      const segment = draft?.segments.find(item => item.id === payload.segmentId)
+      if (!exhibit || !draft || !segment) {
+        this.notice = '对应段落已不存在，未写入。'
+        return false
+      }
+      // 已确认段落只提示，不写入正文
+      if (segment.locked) {
+        this.notice = '该段落已确认锁定，仅提示，不写入正文。'
+        return false
+      }
+      this.commit(() => {
+        segment.content = payload.afterText
+        draft.updatedAt = new Date().toISOString()
+      })
+      const at = new Date().toISOString()
+      const logs: TermLog[] = payload.from.map((from, index) => ({
+        id: `termlog-${Date.now()}-${index}`,
+        termId: payload.termId,
+        zh: payload.zh,
+        languageId: payload.languageId,
+        exhibitId: exhibit.id,
+        exhibitTitle: exhibit.title,
+        segmentId: segment.id,
+        segmentLabel: segment.label,
+        from,
+        to: payload.to,
+        at
+      }))
+      this.termLogs = [...logs, ...this.termLogs].slice(0, 200)
+      this.persist()
+      this.notice = `已按标准译法替换 ${payload.from.length} 种旧译，并写入处理记录。`
+      return true
     },
     undo() {
       const state = this.past.pop()
